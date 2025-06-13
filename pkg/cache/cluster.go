@@ -600,6 +600,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 	var retryCount int64 = 0
 	resourceVersion := ""
+	itemCount := 0
 	totalTime := time.Duration(0)
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
@@ -630,6 +631,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 			duration := time.Since(start)
 			totalTime += duration
+			itemCount += len(res.Items)
 
 			if len(res.Items) > 0 {
 				c.log.Info(
@@ -637,6 +639,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 					"length", len(res.Items),
 					"duration", time.Since(start).Milliseconds(),
 					"listDuration", totalTime.Milliseconds(),
+					"itemCount", itemCount,
 					"groupKind", res.Items[0].GroupVersionKind().GroupKind().String(),
 					"functionName", "listResources",
 				)
