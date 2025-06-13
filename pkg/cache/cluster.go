@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -1025,6 +1026,8 @@ func (c *clusterCache) sync() error {
 		c.namespacedResources[api.GroupKind] = api.Meta.Namespaced
 		lock.Unlock()
 
+		syncMode := os.Getenv("SYNC_MODE")
+
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
 			var (
 				start              = time.Now()
@@ -1038,6 +1041,37 @@ func (c *clusterCache) sync() error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
+						switch syncMode {
+						case "baseline":
+							procStart := time.Now()
+							lock.Lock()
+							newRes := c.newResource(un)
+							c.setNode(newRes)
+							itemCount++
+							processingDuration += time.Since(procStart)
+							lock.Unlock()
+						case "res":
+							procStart := time.Now()
+							newRes := c.newResource(un)
+							lock.Lock()
+							c.setNode(newRes)
+							itemCount++
+							processingDuration += time.Since(procStart)
+							lock.Unlock()
+						case "pool":
+							pool.Run(func() {
+								procStart := time.Now()
+								newRes := c.newResource(un)
+								lock.Lock()
+								c.setNode(newRes)
+								itemCount++
+								processingDuration += time.Since(procStart)
+								lock.Unlock()
+							})
+						default:
+							return fmt.Errorf("unknown sync mode %s", syncMode)
+
+						}
 						pool.Run(func() {
 							procStart := time.Now()
 							newRes := c.newResource(un)
@@ -1084,6 +1118,7 @@ func (c *clusterCache) sync() error {
 				"itemCount", itemCount,
 				"groupKind", api.GroupKind.String(),
 				"functionName", "sync",
+				"syncMode", syncMode,
 			)
 
 			go c.watchEvents(ctx, api, resClient, ns, resourceVersion)
