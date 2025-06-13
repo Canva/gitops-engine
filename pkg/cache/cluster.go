@@ -635,7 +635,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 				c.log.Info(
 					"List page",
 					"length", len(res.Items),
-					"Duration", time.Since(start).Milliseconds(),
+					"duration", time.Since(start).Milliseconds(),
 					"listDuration", totalTime.Milliseconds(),
 					"groupKind", res.Items[0].GroupVersionKind().GroupKind().String(),
 					"functionName", "listResources",
