@@ -391,6 +391,17 @@ func (c *clusterCache) deleteAPIResource(info kube.APIResourceInfo) {
 }
 
 func (c *clusterCache) replaceResourceCache(gk schema.GroupKind, resources []*Resource, ns string) {
+	start := time.Now()
+	defer func() {
+		c.log.Info(
+			"Replace resource cache",
+			"duration", time.Since(start).Milliseconds(),
+			"itemCount", len(resources),
+			"groupKind", gk.String(),
+			"functionName", "replaceResourceCache",
+		)
+	}()
+
 	objByKey := make(map[kube.ResourceKey]*Resource)
 	for i := range resources {
 		objByKey[resources[i].ResourceKey()] = resources[i]
@@ -589,6 +600,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 	var retryCount int64 = 0
 	resourceVersion := ""
+	totalTime := time.Duration(0)
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
 		var listRetry wait.Backoff
@@ -601,7 +613,11 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 		listRetry.Steps = int(c.listRetryLimit)
 		err := retry.OnError(listRetry, c.listRetryFunc, func() error {
-			var ierr error
+			var (
+				ierr  error
+				start = time.Now()
+			)
+
 			res, ierr = resClient.List(ctx, opts)
 			if ierr != nil {
 				// Log out a retry
@@ -611,6 +627,21 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 				}
 				return ierr
 			}
+
+			duration := time.Since(start)
+			totalTime += duration
+
+			if len(res.Items) > 0 {
+				c.log.Info(
+					"List page",
+					"length", len(res.Items),
+					"Duration", time.Since(start).Milliseconds(),
+					"listDuration", totalTime.Milliseconds(),
+					"groupKind", res.Items[0].GroupVersionKind().GroupKind().String(),
+					"functionName", "listResources",
+				)
+			}
+
 			resourceVersion = res.GetResourceVersion()
 			return nil
 		})
@@ -624,13 +655,22 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 // loadInitialState loads the state of all the resources retrieved by the given resource client.
 func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, lock bool) (string, error) {
-	var items []*Resource
+	var (
+		items              []*Resource
+		start              = time.Now()
+		itemCount          = 0
+		processingDuration time.Duration
+	)
+
 	resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 		return listPager.EachListItem(ctx, metav1.ListOptions{}, func(obj runtime.Object) error {
 			if un, ok := obj.(*unstructured.Unstructured); !ok {
 				return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 			} else {
+				procStart := time.Now()
+				itemCount++
 				items = append(items, c.newResource(un))
+				processingDuration += time.Since(procStart)
 			}
 			return nil
 		})
@@ -639,6 +679,15 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 	if err != nil {
 		return "", fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
 	}
+
+	c.log.Info(
+		"List resources",
+		"duration", time.Since(start).Milliseconds(),
+		"processingDuration", processingDuration.Milliseconds(),
+		"itemCount", itemCount,
+		"groupKind", api.GroupKind.String(),
+		"functionName", "loadInitialState",
+	)
 
 	if lock {
 		return resourceVersion, runSynced(&c.lock, func() error {
@@ -934,15 +983,24 @@ func (c *clusterCache) sync() error {
 		lock.Unlock()
 
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
+			var (
+				start              = time.Now()
+				itemCount          = 0
+				processingDuration time.Duration
+			)
+
 			resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 				return listPager.EachListItem(context.Background(), metav1.ListOptions{}, func(obj runtime.Object) error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
+						procStart := time.Now()
 						newRes := c.newResource(un)
 						lock.Lock()
+						itemCount++
 						c.setNode(newRes)
 						lock.Unlock()
+						processingDuration += time.Since(procStart)
 					}
 					return nil
 				})
@@ -968,6 +1026,15 @@ func (c *clusterCache) sync() error {
 				}
 				return fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
 			}
+
+			c.log.Info(
+				"List resources",
+				"duration", time.Since(start).Milliseconds(),
+				"processingDuration", processingDuration.Milliseconds(),
+				"itemCount", itemCount,
+				"groupKind", api.GroupKind.String(),
+				"functionName", "sync",
+			)
 
 			go c.watchEvents(ctx, api, resClient, ns, resourceVersion)
 
