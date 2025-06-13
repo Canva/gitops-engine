@@ -72,3 +72,12 @@ func TestSetEventsProcessingInterval(t *testing.T) {
 	cache.Invalidate(SetEventProcessingInterval(interval))
 	assert.Equal(t, interval, cache.eventProcessingInterval)
 }
+
+func TestSetListItemWorkerPoolSize(t *testing.T) {
+	cache := NewClusterCache(&rest.Config{})
+	assert.Equal(t, defaultListItemWorkerPoolSize, cache.listItemWorkerPoolSize)
+
+	size := int64(10)
+	cache.Invalidate(SetListItemWorkerPoolSize(size))
+	assert.Equal(t, size, cache.listItemWorkerPoolSize)
+}

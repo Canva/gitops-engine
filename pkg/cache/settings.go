@@ -81,6 +81,13 @@ func SetConfig(config *rest.Config) UpdateSettingsFunc {
 	}
 }
 
+// SetListItemWorkerPoolSize sets the size of the list item worker pool.
+func SetListItemWorkerPoolSize(listItemWorkerPoolSize int64) UpdateSettingsFunc {
+	return func(cache *clusterCache) {
+		cache.listItemWorkerPoolSize = listItemWorkerPoolSize
+	}
+}
+
 // SetListPageSize sets the page size for list pager.
 func SetListPageSize(listPageSize int64) UpdateSettingsFunc {
 	return func(cache *clusterCache) {

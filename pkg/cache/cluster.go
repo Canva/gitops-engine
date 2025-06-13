@@ -57,6 +57,8 @@ const (
 	// Limit is required to avoid memory spikes during cache initialization.
 	// The default limit of 50 is chosen based on experiments.
 	defaultListSemaphoreWeight = 50
+	// defaultListItemWorkerPoolSize is the default worker pool size for processing k8s list items concurrently.
+	defaultListItemWorkerPoolSize = int64(1)
 	// defaultEventProcessingInterval is the default interval for processing events
 	defaultEventProcessingInterval = 100 * time.Millisecond
 )
@@ -80,6 +82,32 @@ type apiMeta struct {
 type eventMeta struct {
 	event watch.EventType
 	un    *unstructured.Unstructured
+}
+
+// listItemWorkerPool provides concurrent processing of items returned by K8s list queries.
+type listItemWorkerPool struct {
+	size  int64
+	slots chan struct{}
+	tasks sync.WaitGroup
+}
+
+// Run executes the given task concurrently, blocking if the pool is at capacity.
+func (p *listItemWorkerPool) Run(task func()) {
+	p.tasks.Add(1)
+	p.slots <- struct{}{}
+
+	go func() {
+		defer func() {
+			<-p.slots
+			p.tasks.Done()
+		}()
+		task()
+	}()
+}
+
+// Wait blocks until all submitted tasks have completed.
+func (p *listItemWorkerPool) Wait() {
+	p.tasks.Wait()
 }
 
 // ClusterInfo holds cluster cache stats
@@ -163,15 +191,16 @@ type ListRetryFunc func(err error) bool
 func NewClusterCache(config *rest.Config, opts ...UpdateSettingsFunc) *clusterCache {
 	log := textlogger.NewLogger(textlogger.NewConfig())
 	cache := &clusterCache{
-		settings:           Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
-		apisMeta:           make(map[schema.GroupKind]*apiMeta),
-		eventMetaCh:        nil,
-		listPageSize:       defaultListPageSize,
-		listPageBufferSize: defaultListPageBufferSize,
-		listSemaphore:      semaphore.NewWeighted(defaultListSemaphoreWeight),
-		resources:          make(map[kube.ResourceKey]*Resource),
-		nsIndex:            make(map[string]map[kube.ResourceKey]*Resource),
-		config:             config,
+		settings:               Settings{ResourceHealthOverride: &noopSettings{}, ResourcesFilter: &noopSettings{}},
+		apisMeta:               make(map[schema.GroupKind]*apiMeta),
+		eventMetaCh:            nil,
+		listItemWorkerPoolSize: defaultListItemWorkerPoolSize,
+		listPageSize:           defaultListPageSize,
+		listPageBufferSize:     defaultListPageBufferSize,
+		listSemaphore:          semaphore.NewWeighted(defaultListSemaphoreWeight),
+		resources:              make(map[kube.ResourceKey]*Resource),
+		nsIndex:                make(map[string]map[kube.ResourceKey]*Resource),
+		config:                 config,
 		kubectl: &kube.KubectlCmd{
 			Log:    log,
 			Tracer: tracing.NopTracer{},
@@ -214,7 +243,8 @@ type clusterCache struct {
 	clusterSyncRetryTimeout time.Duration
 	// ticker interval for events processing
 	eventProcessingInterval time.Duration
-
+	// size of the worker pool processing return list items concurrently.
+	listItemWorkerPoolSize int64
 	// size of a page for list operations pager.
 	listPageSize int64
 	// number of pages to prefetch for list pager.
@@ -663,6 +693,8 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 		start              = time.Now()
 		itemCount          = 0
 		processingDuration time.Duration
+		itemsLock          sync.Mutex
+		pool               = c.listItemWorkerPool()
 	)
 
 	resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
@@ -670,14 +702,22 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 			if un, ok := obj.(*unstructured.Unstructured); !ok {
 				return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 			} else {
-				procStart := time.Now()
-				itemCount++
-				items = append(items, c.newResource(un))
-				processingDuration += time.Since(procStart)
+				pool.Run(func() {
+					procStart := time.Now()
+					res := c.newResource(un)
+					itemsLock.Lock()
+					items = append(items, res)
+					itemCount++
+					processingDuration += time.Since(procStart)
+					itemsLock.Unlock()
+				})
 			}
 			return nil
 		})
 	})
+
+	// Wait until all tasks submitted to the pool have finished processing.
+	pool.Wait()
 
 	if err != nil {
 		return "", fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
@@ -990,6 +1030,7 @@ func (c *clusterCache) sync() error {
 				start              = time.Now()
 				itemCount          = 0
 				processingDuration time.Duration
+				pool               = c.listItemWorkerPool()
 			)
 
 			resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
@@ -997,17 +1038,23 @@ func (c *clusterCache) sync() error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
-						procStart := time.Now()
-						newRes := c.newResource(un)
-						lock.Lock()
-						itemCount++
-						c.setNode(newRes)
-						lock.Unlock()
-						processingDuration += time.Since(procStart)
+						pool.Run(func() {
+							procStart := time.Now()
+							newRes := c.newResource(un)
+							lock.Lock()
+							c.setNode(newRes)
+							itemCount++
+							processingDuration += time.Since(procStart)
+							lock.Unlock()
+						})
 					}
 					return nil
 				})
 			})
+
+			// Wait until all tasks submitted to the pool have finished processing.
+			pool.Wait()
+
 			if err != nil {
 				if c.isRestrictedResource(err) {
 					keep := false
@@ -1500,6 +1547,14 @@ func (c *clusterCache) GetClusterInfo() ClusterInfo {
 		LastCacheSyncTime: c.syncStatus.syncTime,
 		SyncError:         c.syncStatus.syncError,
 		APIResources:      c.apiResources,
+	}
+}
+
+func (c *clusterCache) listItemWorkerPool() *listItemWorkerPool {
+	return &listItemWorkerPool{
+		size:  c.listItemWorkerPoolSize,
+		slots: make(chan struct{}, c.listItemWorkerPoolSize),
+		tasks: sync.WaitGroup{},
 	}
 }
 
