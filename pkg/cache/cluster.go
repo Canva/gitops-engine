@@ -995,9 +995,9 @@ func (c *clusterCache) sync() error {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
 						procStart := time.Now()
-						newRes := c.newResource(un)
 						lock.Lock()
 						itemCount++
+						newRes := c.newResource(un)
 						c.setNode(newRes)
 						lock.Unlock()
 						processingDuration += time.Since(procStart)
