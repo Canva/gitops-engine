@@ -1072,15 +1072,6 @@ func (c *clusterCache) sync() error {
 							return fmt.Errorf("unknown sync mode %s", syncMode)
 
 						}
-						pool.Run(func() {
-							procStart := time.Now()
-							newRes := c.newResource(un)
-							lock.Lock()
-							c.setNode(newRes)
-							itemCount++
-							processingDuration += time.Since(procStart)
-							lock.Unlock()
-						})
 					}
 					return nil
 				})
