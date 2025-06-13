@@ -633,6 +633,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 	resourceVersion := ""
 	itemCount := 0
 	totalTime := time.Duration(0)
+	lastListCompleted := time.Time{}
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
 		var listRetry wait.Backoff
@@ -650,7 +651,14 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 				start = time.Now()
 			)
 
+			idleTime := time.Duration(0)
+			if !lastListCompleted.IsZero() {
+				idleTime = time.Since(lastListCompleted)
+			}
+
 			res, ierr = resClient.List(ctx, opts)
+			lastListCompleted = time.Now()
+
 			if ierr != nil {
 				// Log out a retry
 				if c.listRetryLimit > 1 && c.listRetryFunc(ierr) {
@@ -673,6 +681,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 					"itemCount", itemCount,
 					"groupKind", res.Items[0].GroupVersionKind().GroupKind().String(),
 					"functionName", "listResources",
+					"idleTime", idleTime.Milliseconds(),
 				)
 			}
 
