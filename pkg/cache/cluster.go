@@ -589,6 +589,14 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 	var retryCount int64 = 0
 	resourceVersion := ""
+
+	var (
+		totalItems        int           // total items returned during list
+		totalPageDuration time.Duration // sum of time spent in client.List(..)
+		lastPageCompleted time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
+		start             time.Time     // time list began
+	)
+
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
 		var listRetry wait.Backoff
@@ -602,6 +610,20 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 		listRetry.Steps = int(c.listRetryLimit)
 		err := retry.OnError(listRetry, c.listRetryFunc, func() error {
 			var ierr error
+
+			// track when listing has begun
+			if start.IsZero() {
+				start = time.Now()
+			}
+
+			// determine how much time spent between client.List(..) calls
+			idleTime := time.Duration(0)
+			if !lastPageCompleted.IsZero() {
+				idleTime = time.Since(lastPageCompleted)
+			}
+
+			pageStart := time.Now()
+
 			res, ierr = resClient.List(ctx, opts)
 			if ierr != nil {
 				// Log out a retry
@@ -611,6 +633,24 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 				}
 				return ierr
 			}
+
+			pageDuration := time.Since(pageStart) // duration of client.List(..) call
+			lastPageCompleted = time.Now()
+			totalPageDuration += pageDuration // track the amount of sum of all client.List(..) durations
+			totalItems += len(res.Items)      // track the amount of items returned
+
+			if len(res.Items) > 0 {
+				c.log.Info(
+					"List page retrieved",
+					"groupKind", res.Items[0].GroupVersionKind().GroupKind().String(),
+					"duration", time.Since(start).Milliseconds(),
+					"procDuration", totalPageDuration.Milliseconds(),
+					"pageDuration", pageDuration.Milliseconds(),
+					"idleTime", idleTime.Milliseconds(),
+					"totalItems", totalItems,
+				)
+			}
+
 			resourceVersion = res.GetResourceVersion()
 			return nil
 		})
@@ -625,12 +665,59 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 // loadInitialState loads the state of all the resources retrieved by the given resource client.
 func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourceInfo, resClient dynamic.ResourceInterface, ns string, lock bool) (string, error) {
 	var items []*Resource
+
+	var (
+		totalItems        int           // total items returned during list
+		totalItemDuration time.Duration // sum of time spent in processing items
+		lastPageCompleted time.Time     // time the last page was processed, used to track time between processing pages
+		idleTime          time.Duration // idle time between the processing pages
+		pageStart         time.Time     // time page processing began
+		start             time.Time     // time list processing began
+		pageSize          = int(c.listPageSize)
+	)
+
+	logPageProcessed := func() {
+		c.log.Info(
+			"List page processed",
+			"groupKind", api.GroupKind.String(),
+			"duration", time.Since(start).Milliseconds(),
+			"procDuration", totalItemDuration.Milliseconds(),
+			"pageDuration", time.Since(pageStart).Milliseconds(),
+			"idleTime", idleTime.Milliseconds(),
+			"totalItems", totalItems,
+			"functionName", "loadInitialState",
+		)
+	}
+
 	resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 		return listPager.EachListItem(ctx, metav1.ListOptions{}, func(obj runtime.Object) error {
 			if un, ok := obj.(*unstructured.Unstructured); !ok {
 				return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 			} else {
+				if totalItems == 0 {
+					// start of list processing
+					start = time.Now()
+				}
+				if totalItems%pageSize == 0 {
+					// start of page
+					if !lastPageCompleted.IsZero() {
+						idleTime = time.Since(lastPageCompleted)
+					}
+					pageStart = time.Now()
+				}
+
+				itemStart := time.Now()
+
 				items = append(items, c.newResource(un))
+
+				totalItemDuration += time.Since(itemStart)
+				totalItems++
+
+				if totalItems%pageSize == 0 {
+					// end of page
+					logPageProcessed()
+					lastPageCompleted = time.Now()
+				}
 			}
 			return nil
 		})
@@ -639,6 +726,8 @@ func (c *clusterCache) loadInitialState(ctx context.Context, api kube.APIResourc
 	if err != nil {
 		return "", fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
 	}
+
+	logPageProcessed()
 
 	if lock {
 		return resourceVersion, runSynced(&c.lock, func() error {
@@ -934,14 +1023,60 @@ func (c *clusterCache) sync() error {
 		lock.Unlock()
 
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
+			var (
+				totalItems        int           // total items returned during list
+				totalItemDuration time.Duration // sum of time spent in processing items
+				lastPageCompleted time.Time     // time the last page was processed, used to track time between processing pages
+				idleTime          time.Duration // idle time between the processing pages
+				pageStart         time.Time     // time page processing began
+				start             time.Time     // time list processing began
+				pageSize          = int(c.listPageSize)
+			)
+
+			logPageProcessed := func() {
+				c.log.Info(
+					"List page processed",
+					"groupKind", api.GroupKind.String(),
+					"duration", time.Since(start).Milliseconds(),
+					"procDuration", totalItemDuration.Milliseconds(),
+					"pageDuration", time.Since(pageStart).Milliseconds(),
+					"idleTime", idleTime.Milliseconds(),
+					"totalItems", totalItems,
+					"functionName", "sync",
+				)
+			}
+
 			resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 				return listPager.EachListItem(context.Background(), metav1.ListOptions{}, func(obj runtime.Object) error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
+						if totalItems == 0 {
+							// start of list processing
+							start = time.Now()
+						}
+						if totalItems%pageSize == 0 {
+							// start of page
+							if !lastPageCompleted.IsZero() {
+								idleTime = time.Since(lastPageCompleted)
+							}
+							pageStart = time.Now()
+						}
+
+						itemStart := time.Now()
+
 						lock.Lock()
 						c.setNode(c.newResource(un))
 						lock.Unlock()
+
+						totalItemDuration += time.Since(itemStart)
+						totalItems++
+
+						if totalItems%pageSize == 0 {
+							// end of page
+							logPageProcessed()
+							lastPageCompleted = time.Now()
+						}
 					}
 					return nil
 				})
@@ -968,6 +1103,7 @@ func (c *clusterCache) sync() error {
 				return fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
 			}
 
+			logPageProcessed()
 			go c.watchEvents(ctx, api, resClient, ns, resourceVersion)
 
 			return nil
