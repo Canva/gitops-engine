@@ -674,7 +674,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 
 			if len(res.Items) > 0 {
 				c.log.Info(
-					"List page",
+					"List page retrieved",
 					"length", len(res.Items),
 					"duration", time.Since(start).Milliseconds(),
 					"listDuration", totalTime.Milliseconds(),
@@ -1045,20 +1045,26 @@ func (c *clusterCache) sync() error {
 				pool               = c.listItemWorkerPool()
 			)
 
+			logProcessed := func() {
+				if itemCount%int(c.listPageSize) == 0 {
+					c.log.Info(
+						"List page processed",
+						"duration", time.Since(start).Milliseconds(),
+						"processingDuration", processingDuration.Milliseconds(),
+						"itemCount", itemCount,
+						"groupKind", api.GroupKind.String(),
+						"functionName", "sync",
+						"syncMode", syncMode,
+					)
+				}
+			}
+
 			resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 				return listPager.EachListItem(context.Background(), metav1.ListOptions{}, func(obj runtime.Object) error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
 					} else {
 						switch syncMode {
-						case "baseline":
-							procStart := time.Now()
-							lock.Lock()
-							newRes := c.newResource(un)
-							c.setNode(newRes)
-							itemCount++
-							processingDuration += time.Since(procStart)
-							lock.Unlock()
 						case "res":
 							procStart := time.Now()
 							newRes := c.newResource(un)
@@ -1066,6 +1072,7 @@ func (c *clusterCache) sync() error {
 							c.setNode(newRes)
 							itemCount++
 							processingDuration += time.Since(procStart)
+							logProcessed()
 							lock.Unlock()
 						case "pool":
 							pool.Run(func() {
@@ -1075,10 +1082,18 @@ func (c *clusterCache) sync() error {
 								c.setNode(newRes)
 								itemCount++
 								processingDuration += time.Since(procStart)
+								logProcessed()
 								lock.Unlock()
 							})
 						default:
-							return fmt.Errorf("unknown sync mode %s", syncMode)
+							procStart := time.Now()
+							lock.Lock()
+							newRes := c.newResource(un)
+							c.setNode(newRes)
+							itemCount++
+							processingDuration += time.Since(procStart)
+							logProcessed()
+							lock.Unlock()
 
 						}
 					}
@@ -1112,7 +1127,7 @@ func (c *clusterCache) sync() error {
 			}
 
 			c.log.Info(
-				"List resources",
+				"List processing complete",
 				"duration", time.Since(start).Milliseconds(),
 				"processingDuration", processingDuration.Milliseconds(),
 				"itemCount", itemCount,
