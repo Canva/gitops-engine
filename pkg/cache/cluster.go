@@ -73,6 +73,8 @@ const (
 	RespectRbacStrict
 )
 
+var syncMode = os.Getenv("SYNC_MODE")
+
 type apiMeta struct {
 	namespaced bool
 	// watchCancel stops the watch of all resources for this API. This gets called when the cache is invalidated or when
@@ -632,8 +634,9 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 	var retryCount int64 = 0
 	resourceVersion := ""
 	itemCount := 0
-	totalTime := time.Duration(0)
-	lastListCompleted := time.Time{}
+	start := time.Now()
+	totalPageDuration := time.Duration(0)
+	lastPageCompleted := time.Time{}
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
 		var listRetry wait.Backoff
@@ -647,17 +650,17 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 		listRetry.Steps = int(c.listRetryLimit)
 		err := retry.OnError(listRetry, c.listRetryFunc, func() error {
 			var (
-				ierr  error
-				start = time.Now()
+				ierr      error
+				pageStart = time.Now()
 			)
 
 			idleTime := time.Duration(0)
-			if !lastListCompleted.IsZero() {
-				idleTime = time.Since(lastListCompleted)
+			if !lastPageCompleted.IsZero() {
+				idleTime = time.Since(lastPageCompleted)
 			}
 
 			res, ierr = resClient.List(ctx, opts)
-			lastListCompleted = time.Now()
+			lastPageCompleted = time.Now()
 
 			if ierr != nil {
 				// Log out a retry
@@ -668,20 +671,21 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 				return ierr
 			}
 
-			duration := time.Since(start)
-			totalTime += duration
+			pageDuration := time.Since(pageStart)
+			totalPageDuration += pageDuration
 			itemCount += len(res.Items)
 
 			if len(res.Items) > 0 {
 				c.log.Info(
 					"List page retrieved",
-					"length", len(res.Items),
 					"duration", time.Since(start).Milliseconds(),
-					"listDuration", totalTime.Milliseconds(),
+					"processingDuration", totalPageDuration.Milliseconds(),
+					"pageDuration", pageDuration.Milliseconds(),
 					"itemCount", itemCount,
 					"groupKind", res.Items[0].GroupVersionKind().GroupKind().String(),
 					"functionName", "listResources",
 					"idleTime", idleTime.Milliseconds(),
+					"syncMode", syncMode,
 				)
 			}
 
@@ -1035,8 +1039,6 @@ func (c *clusterCache) sync() error {
 		c.namespacedResources[api.GroupKind] = api.Meta.Namespaced
 		lock.Unlock()
 
-		syncMode := os.Getenv("SYNC_MODE")
-
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
 			var (
 				start              = time.Now()
@@ -1125,6 +1127,8 @@ func (c *clusterCache) sync() error {
 				}
 				return fmt.Errorf("failed to load initial state of resource %s: %w", api.GroupKind.String(), err)
 			}
+
+			logProcessed()
 
 			c.log.Info(
 				"List processing complete",
