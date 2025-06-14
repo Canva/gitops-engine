@@ -3,8 +3,10 @@ package cache
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -591,11 +593,18 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 	resourceVersion := ""
 
 	var (
-		totalItems        int           // total items returned during list
-		totalPageDuration time.Duration // sum of time spent in client.List(..)
-		lastPageCompleted time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
-		start             time.Time     // time list began
+		totalItems            int           // total items returned during list
+		totalPageDuration     time.Duration // sum of time spent in client.List(..)
+		lastPageCompleted     time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
+		start                 time.Time     // time list began
+		confListSemaphoreSize int           // store semaphore size for logging purposes
 	)
+
+	if v := os.Getenv("ARGOCD_CLUSTER_CACHE_LIST_SEMAPHORE"); v != "" {
+		confListSemaphoreSize, _ = strconv.Atoi(v)
+	} else {
+		confListSemaphoreSize = defaultListSemaphoreWeight
+	}
 
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
 		var res *unstructured.UnstructuredList
@@ -648,6 +657,9 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 					"pageDuration", pageDuration.Milliseconds(),
 					"idleTime", idleTime.Milliseconds(),
 					"totalItems", totalItems,
+					"confListSemaphoreSize", confListSemaphoreSize,
+					"confListPageSize", c.listPageSize,
+					"confListPageBufferSize", c.listPageBufferSize,
 				)
 			}
 
