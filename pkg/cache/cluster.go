@@ -1036,13 +1036,16 @@ func (c *clusterCache) sync() error {
 
 		return c.processApi(client, api, func(resClient dynamic.ResourceInterface, ns string) error {
 			var (
-				totalItems        int           // total items returned during list
-				totalItemDuration time.Duration // sum of time spent in processing items
-				lastPageCompleted time.Time     // time the last page was processed, used to track time between processing pages
-				idleTime          time.Duration // idle time between the processing pages
-				pageStart         time.Time     // time page processing began
-				start             time.Time     // time list processing began
-				pageSize          = int(c.listPageSize)
+				totalItems               int           // total items returned during list
+				totalItemDuration        time.Duration // sum of time spent in processing items
+				totalLockWaitDuration    time.Duration // sum of time spent waiting for lock
+				totalNewResourceDuration time.Duration // sum of time spent in c.newResource
+				totalSetNodeDuration     time.Duration // sum of time spent in c.setNode
+				lastPageCompleted        time.Time     // time the last page was processed, used to track time between processing pages
+				idleTime                 time.Duration // idle time between the processing pages
+				pageStart                time.Time     // time page processing began
+				start                    time.Time     // time list processing began
+				pageSize                 = int(c.listPageSize)
 			)
 
 			logPageProcessed := func() {
@@ -1051,6 +1054,9 @@ func (c *clusterCache) sync() error {
 					"groupKind", api.GroupKind.String(),
 					"duration", time.Since(start).Milliseconds(),
 					"procDuration", totalItemDuration.Milliseconds(),
+					"lockWaitDuration", totalLockWaitDuration.Milliseconds(),
+					"newResourceDuration", totalNewResourceDuration.Milliseconds(),
+					"setNodeDuration", totalSetNodeDuration.Milliseconds(),
 					"pageDuration", time.Since(pageStart).Milliseconds(),
 					"idleTime", idleTime.Milliseconds(),
 					"totalItems", totalItems,
@@ -1077,8 +1083,18 @@ func (c *clusterCache) sync() error {
 
 						itemStart := time.Now()
 
+						lockWaitStart := time.Now()
 						lock.Lock()
-						c.setNode(c.newResource(un))
+						totalLockWaitDuration += time.Since(lockWaitStart)
+
+						newResourceStart := time.Now()
+						res := c.newResource(un)
+						totalNewResourceDuration += time.Since(newResourceStart)
+
+						setNodeStart := time.Now()
+						c.setNode(res)
+						totalSetNodeDuration += time.Since(setNodeStart)
+
 						lock.Unlock()
 
 						totalItemDuration += time.Since(itemStart)
