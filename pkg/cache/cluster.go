@@ -72,7 +72,7 @@ const (
 	RespectRbacStrict
 )
 
-var newResourceOutsideLock = os.Getenv("TEMP_NEW_RESOURCE_OUTSIDE_LOCK") == "1"
+var tempSyncMode = os.Getenv("TEMP_SYNC_MODE")
 
 type apiMeta struct {
 	namespaced bool
@@ -595,12 +595,12 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 	resourceVersion := ""
 
 	var (
-		totalItems                 int           // total items returned during list
-		totalPageDuration          time.Duration // sum of time spent in client.List(..)
-		lastPageCompleted          time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
-		start                      time.Time     // time list began
-		confListSemaphoreSize      int           // store semaphore size for logging purposes
-		confNewResourceOutsideLock int           // logging purposes
+		totalItems            int           // total items returned during list
+		totalPageDuration     time.Duration // sum of time spent in client.List(..)
+		lastPageCompleted     time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
+		start                 time.Time     // time list began
+		confListSemaphoreSize int           // store semaphore size for logging purposes
+		confSyncMode          int           // logging purposes
 	)
 
 	if v := os.Getenv("ARGOCD_CLUSTER_CACHE_LIST_SEMAPHORE"); v != "" {
@@ -609,10 +609,10 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 		confListSemaphoreSize = defaultListSemaphoreWeight
 	}
 
-	if newResourceOutsideLock {
-		confNewResourceOutsideLock = 1
+	if tempSyncMode != "" {
+		confSyncMode, _ = strconv.Atoi(tempSyncMode)
 	} else {
-		confNewResourceOutsideLock = 0
+		confSyncMode = 0
 	}
 
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
@@ -669,7 +669,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 					"confListSemaphoreSize", confListSemaphoreSize,
 					"confListPageSize", c.listPageSize,
 					"confListPageBufferSize", c.listPageBufferSize,
-					"confNewResourceOutsideLock", confNewResourceOutsideLock,
+					"confSyncMode", confSyncMode,
 				)
 			}
 
@@ -1054,7 +1054,7 @@ func (c *clusterCache) sync() error {
 				lastPageCompleted        time.Time     // time the last page was processed, used to track time between processing pages
 				idleTime                 time.Duration // idle time between the processing pages
 				pageStart                time.Time     // time page processing began
-				start                    time.Time     // time list processing began
+				start                    = time.Now()  // time list processing began
 				pageSize                 = int(c.listPageSize)
 			)
 
@@ -1074,10 +1074,65 @@ func (c *clusterCache) sync() error {
 				)
 			}
 
+			listItemSemaphore := semaphore.NewWeighted(8)
+			listItemWaitGroup := sync.WaitGroup{}
+			metricLock := sync.Mutex{}
+
 			resourceVersion, err := c.listResources(ctx, resClient, func(listPager *pager.ListPager) error {
 				return listPager.EachListItem(context.Background(), metav1.ListOptions{}, func(obj runtime.Object) error {
 					if un, ok := obj.(*unstructured.Unstructured); !ok {
 						return fmt.Errorf("object %s/%s has an unexpected type", un.GroupVersionKind().String(), un.GetName())
+					} else if tempSyncMode == "2" {
+						metricLock.Lock()
+						if totalItems == 0 {
+							// start of list processing
+							start = time.Now()
+						}
+						if totalItems%pageSize == 0 {
+							// start of page
+							if !lastPageCompleted.IsZero() {
+								idleTime = time.Since(lastPageCompleted)
+							}
+							pageStart = time.Now()
+						}
+						metricLock.Unlock()
+
+						if sErr := listItemSemaphore.Acquire(ctx, 1); sErr != nil {
+							return sErr
+						}
+						listItemWaitGroup.Add(1)
+						go func() {
+							defer func() {
+								listItemWaitGroup.Done()
+								listItemSemaphore.Release(1)
+							}()
+
+							itemStart := time.Now()
+
+							newResourceStart := time.Now()
+							res := c.newResource(un)
+							newResourceDuration := time.Since(newResourceStart)
+
+							lockWaitStart := time.Now()
+							lock.Lock()
+							totalLockWaitDuration += time.Since(lockWaitStart)
+							totalNewResourceDuration += newResourceDuration
+
+							setNodeStart := time.Now()
+							c.setNode(res)
+							totalSetNodeDuration += time.Since(setNodeStart)
+
+							totalItemDuration += time.Since(itemStart)
+							totalItems++
+
+							if totalItems%pageSize == 0 {
+								// end of page
+								logPageProcessed()
+								lastPageCompleted = time.Now()
+							}
+
+							lock.Unlock()
+						}()
 					} else {
 						if totalItems == 0 {
 							// start of list processing
@@ -1098,7 +1153,7 @@ func (c *clusterCache) sync() error {
 
 						// calling c.newResource(..) outside the lock is an optimisation
 						// which only landed in v3.
-						if newResourceOutsideLock {
+						if tempSyncMode == "1" {
 							newResourceStart = time.Now()
 							res = c.newResource(un)
 							totalNewResourceDuration += time.Since(newResourceStart)
@@ -1108,7 +1163,7 @@ func (c *clusterCache) sync() error {
 						lock.Lock()
 						totalLockWaitDuration += time.Since(lockWaitStart)
 
-						if !newResourceOutsideLock {
+						if tempSyncMode != "1" {
 							newResourceStart = time.Now()
 							res = c.newResource(un)
 							totalNewResourceDuration += time.Since(newResourceStart)
@@ -1132,6 +1187,9 @@ func (c *clusterCache) sync() error {
 					return nil
 				})
 			})
+
+			listItemWaitGroup.Wait()
+
 			if err != nil {
 				if c.isRestrictedResource(err) {
 					keep := false
