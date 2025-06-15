@@ -72,6 +72,8 @@ const (
 	RespectRbacStrict
 )
 
+var newResourceOutsideLock = os.Getenv("TEMP_NEW_RESOURCE_OUTSIDE_LOCK") == "1"
+
 type apiMeta struct {
 	namespaced bool
 	// watchCancel stops the watch of all resources for this API. This gets called when the cache is invalidated or when
@@ -593,17 +595,24 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 	resourceVersion := ""
 
 	var (
-		totalItems            int           // total items returned during list
-		totalPageDuration     time.Duration // sum of time spent in client.List(..)
-		lastPageCompleted     time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
-		start                 time.Time     // time list began
-		confListSemaphoreSize int           // store semaphore size for logging purposes
+		totalItems                 int           // total items returned during list
+		totalPageDuration          time.Duration // sum of time spent in client.List(..)
+		lastPageCompleted          time.Time     // time the last page was retrieved, used to track time between client.List(..) calls
+		start                      time.Time     // time list began
+		confListSemaphoreSize      int           // store semaphore size for logging purposes
+		confNewResourceOutsideLock int           // logging purposes
 	)
 
 	if v := os.Getenv("ARGOCD_CLUSTER_CACHE_LIST_SEMAPHORE"); v != "" {
 		confListSemaphoreSize, _ = strconv.Atoi(v)
 	} else {
 		confListSemaphoreSize = defaultListSemaphoreWeight
+	}
+
+	if newResourceOutsideLock {
+		confNewResourceOutsideLock = 1
+	} else {
+		confNewResourceOutsideLock = 0
 	}
 
 	listPager := pager.New(func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
@@ -660,6 +669,7 @@ func (c *clusterCache) listResources(ctx context.Context, resClient dynamic.Reso
 					"confListSemaphoreSize", confListSemaphoreSize,
 					"confListPageSize", c.listPageSize,
 					"confListPageBufferSize", c.listPageBufferSize,
+					"confNewResourceOutsideLock", confNewResourceOutsideLock,
 				)
 			}
 
@@ -1083,13 +1093,26 @@ func (c *clusterCache) sync() error {
 
 						itemStart := time.Now()
 
+						var res *Resource
+						var newResourceStart time.Time
+
+						// calling c.newResource(..) outside the lock is an optimisation
+						// which only landed in v3.
+						if newResourceOutsideLock {
+							newResourceStart = time.Now()
+							res = c.newResource(un)
+							totalNewResourceDuration += time.Since(newResourceStart)
+						}
+
 						lockWaitStart := time.Now()
 						lock.Lock()
 						totalLockWaitDuration += time.Since(lockWaitStart)
 
-						newResourceStart := time.Now()
-						res := c.newResource(un)
-						totalNewResourceDuration += time.Since(newResourceStart)
+						if !newResourceOutsideLock {
+							newResourceStart = time.Now()
+							res = c.newResource(un)
+							totalNewResourceDuration += time.Since(newResourceStart)
+						}
 
 						setNodeStart := time.Now()
 						c.setNode(res)
